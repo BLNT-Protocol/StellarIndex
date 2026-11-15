@@ -300,12 +300,24 @@ func passkeyRegistrationOptions(exclusions []protocol.CredentialDescriptor) []we
 	}
 }
 
-// HandlePasskeyBeginRegister returns credential-creation options for navigator.credentials.create(); session-gated, since adding a
-// passkey needs an authenticated user.
-func (h *Handlers) HandlePasskeyBeginRegister(w http.ResponseWriter, r *http.Request) {
+// credentialSession admits a signed-in user whose session is recent, writing the refusal otherwise. Passkeys
+// are how the account signs in, so changing them needs a recent sign-in: otherwise an old stolen cookie could
+// enrol its own key and sign in with it, or remove the owner's keys and lock them out. grace lets a ceremony
+// begun inside the window finish.
+func (h *Handlers) credentialSession(w http.ResponseWriter, r *http.Request, grace time.Duration) (SessionContext, bool) {
 	sc, ok := SessionFromContext(r.Context())
 	if !ok {
 		writeProblem(w, http.StatusUnauthorized, "authentication required", r.URL.Path)
+		return SessionContext{}, false
+	}
+	return sc, h.recentSession(w, sc, r.URL.Path, grace)
+}
+
+// HandlePasskeyBeginRegister returns credential-creation options for navigator.credentials.create(); session-gated, since adding a
+// passkey needs an authenticated user.
+func (h *Handlers) HandlePasskeyBeginRegister(w http.ResponseWriter, r *http.Request) {
+	sc, ok := h.credentialSession(w, r, 0)
+	if !ok {
 		return
 	}
 	wa, err := h.webAuthn()
@@ -376,9 +388,8 @@ type finishRegisterRequest struct {
 
 // HandlePasskeyFinishRegister verifies the attestation against the ceremony cookie's challenge and stores the credential.
 func (h *Handlers) HandlePasskeyFinishRegister(w http.ResponseWriter, r *http.Request) {
-	sc, ok := SessionFromContext(r.Context())
+	sc, ok := h.credentialSession(w, r, passkeyCeremonyTTL)
 	if !ok {
-		writeProblem(w, http.StatusUnauthorized, "authentication required", r.URL.Path)
 		return
 	}
 	// MaxBytesReader, not LimitReader: LimitReader truncates silently at its cap, which would make
@@ -718,9 +729,8 @@ func (h *Handlers) HandlePasskeyList(w http.ResponseWriter, r *http.Request) {
 // HandlePasskeyDelete removes one of the signed-in user's passkeys; owner-scoped in the store query, so another user's credential ID is
 // a 404 like a nonexistent one.
 func (h *Handlers) HandlePasskeyDelete(w http.ResponseWriter, r *http.Request) {
-	sc, ok := SessionFromContext(r.Context())
+	sc, ok := h.credentialSession(w, r, 0)
 	if !ok {
-		writeProblem(w, http.StatusUnauthorized, "authentication required", r.URL.Path)
 		return
 	}
 	id, err := uuid.Parse(r.PathValue("id"))
