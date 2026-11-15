@@ -246,6 +246,46 @@ func TestLockout_StoreFailureFailsOpen(t *testing.T) {
 	}
 }
 
+// A guessing run against one address is otherwise invisible: it is not API-key auth, so the
+// failed-auth counter does not move.
+func TestLockout_GuessingIsCounted(t *testing.T) {
+	const email = "counted@example.com"
+	lr := newLockoutRig(t)
+	read := func(outcome string) float64 {
+		return testutil.ToFloat64(obs.LoginCodeFailuresTotal.WithLabelValues(outcome))
+	}
+	wrong, engaged, locked := read(obs.LoginCodeFailureWrongCode),
+		read(obs.LoginCodeFailureLockoutEngaged), read(obs.LoginCodeFailureLockedOut)
+
+	lr.grind(t, email, maxDurableCodeFailures)
+	if got := read(obs.LoginCodeFailureWrongCode) - wrong; got != maxDurableCodeFailures {
+		t.Errorf("wrong_code moved by %v, want %d", got, maxDurableCodeFailures)
+	}
+	if got := read(obs.LoginCodeFailureLockoutEngaged) - engaged; got != 1 {
+		t.Errorf("lockout_engaged moved by %v, want 1", got)
+	}
+
+	lr.postVerifyCode(t, email, lr.loginAndCode(t, email))
+	if got := read(obs.LoginCodeFailureLockedOut) - locked; got != 1 {
+		t.Errorf("locked_out moved by %v, want 1 for a refusal while locked", got)
+	}
+}
+
+// An owner who mistypes nine times and then signs in on their last attempt was not locked out.
+func TestLockout_CorrectLastAttemptIsNotALockout(t *testing.T) {
+	const email = "ninth@example.com"
+	lr := newLockoutRig(t)
+	engaged := testutil.ToFloat64(obs.LoginCodeFailuresTotal.WithLabelValues(obs.LoginCodeFailureLockoutEngaged))
+
+	lr.grind(t, email, maxDurableCodeFailures-1)
+	if w := lr.postVerifyCode(t, email, lr.loginAndCode(t, email)); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 on the last attempt", w.Code)
+	}
+	if got := testutil.ToFloat64(obs.LoginCodeFailuresTotal.WithLabelValues(obs.LoginCodeFailureLockoutEngaged)) - engaged; got != 0 {
+		t.Errorf("lockout_engaged moved by %v, want 0: the sign-in succeeded", got)
+	}
+}
+
 func lockoutErrors(t *testing.T, op string) float64 {
 	t.Helper()
 	return testutil.ToFloat64(obs.LoginCodeLockoutErrorsTotal.WithLabelValues(op))
