@@ -817,6 +817,10 @@ func run(cfgPath string, dryRun bool) error {
 	// enqueues ACCOUNT-scoped `price.alert` deliveries (via ListWebhooksForAccount, not the global
 	// fan-out). Lives here because this binary writes prices_1m; delivery is the API binary's job.
 	if cfg.PriceAlerts.Enabled {
+		priceAlertFreeze, err := freeze.NewLooker(rdb)
+		if err != nil {
+			return fmt.Errorf("price alerts: freeze looker: %w", err)
+		}
 		paStore := postgresstore.New(store.DB())
 		paWorker := pricealerts.New(
 			postgresstore.NewPriceAlertStore(paStore),
@@ -830,6 +834,7 @@ func run(cfgPath string, dryRun bool) error {
 				// Same decimals correction /v1/price applies before serving — without it a nonstandard-decimals asset's
 				// threshold (set from the corrected price) is compared against a raw ratio 10^k off.
 				decimals: decimalsLookup,
+				freeze:   priceAlertFreeze,
 			},
 			pricealerts.Options{
 				Logger: logger.With("component", "price-alerts"),
@@ -2102,10 +2107,42 @@ type priceAlertVWAPReader struct {
 	// decimals resolves a confirmed non-7dp scale as /v1/price does ([aggregate.ResolveDecimals]), so thresholds compare against corrected
 	// prices; nil means all legs are 7dp.
 	decimals aggregate.DecimalsLookup
+	// freeze answers whether the orchestrator is holding the pair's newest bucket back; nil checks nothing.
+	freeze pairFreezeLooker
+}
+
+// pairFreezeLooker is the freeze-marker read; *freeze.Looker satisfies it.
+type pairFreezeLooker interface {
+	FrozenForPair(ctx context.Context, asset, quote canonical.Asset) (bool, error)
+}
+
+// pairFrozen reports a live freeze marker under any spelling or orientation of the pair: the marker is keyed
+// by the stored pair, which the alert's own spelling need not be.
+func (r priceAlertVWAPReader) pairFrozen(ctx context.Context, base, quote canonical.Asset) (bool, error) {
+	if r.freeze == nil {
+		return false, nil
+	}
+	for _, b := range canonical.AssetAliases(base) {
+		for _, q := range canonical.AssetAliases(quote) {
+			for _, leg := range [2][2]canonical.Asset{{b, q}, {q, b}} {
+				frozen, err := r.freeze.FrozenForPair(ctx, leg[0], leg[1])
+				if err != nil || frozen {
+					return frozen, err
+				}
+			}
+		}
+	}
+	return false, nil
 }
 
 func (r priceAlertVWAPReader) LatestVWAP(ctx context.Context, base, quote canonical.Asset) (string, time.Time, bool, error) {
 	if _, err := canonical.NewPair(base, quote); err != nil {
+		return "", time.Time{}, false, err
+	}
+	// A frozen pair's newest bucket is the one /v1/price refuses to publish, and it usually sits inside the
+	// served-price band below, so the freeze is asked first. An unread marker fails the read: no alert fires
+	// on a bucket nobody could clear.
+	if frozen, err := r.pairFrozen(ctx, base, quote); err != nil || frozen {
 		return "", time.Time{}, false, err
 	}
 	// Walk every spelling of both legs, literal pair first and SAC forms last
@@ -2133,23 +2170,22 @@ func (r priceAlertVWAPReader) LatestVWAP(ctx context.Context, base, quote canoni
 			if r.gate.PriceWithheld(ctx, base, quote, "price_alert") {
 				return "", time.Time{}, false, nil
 			}
-			// Same serving-sanity guard as the API raw-bucket paths: a bare closed bucket bypasses the
-			// orchestrator's outlier / min-volume / freeze filters, so a fat-finger print would fire a
-			// SPURIOUS alert. The guard serves last-known-good off the pair's trailing baseline and is
-			// byte-identical on a healthy bucket. An unvalidated bucket is the guard's fail-open case;
-			// an alert has no stale flag to carry that doubt, so it does not fire (sticky).
+			// Serving-sanity guard, in this body so the raw read and its guard cannot drift apart.
 			served, lowConfidence, _ := pricingguard.GuardServedVWAP1mConfidence(ctx, r.store, r.logger, pair, row)
-			if lowConfidence {
-				return "", time.Time{}, false, nil
-			}
-			return r.adjustServed(b, q, served)
+			return r.adjustServed(pair.Base, pair.Quote, served, lowConfidence)
 		}
 	}
 	return "", time.Time{}, false, nil
 }
 
-// adjustServed applies the /v1/price decimals correction to a guarded bucket.
-func (r priceAlertVWAPReader) adjustServed(b, q canonical.Asset, served timescale.Vwap1mRow) (string, time.Time, bool, error) {
+// adjustServed applies the /v1/price decimals correction to a guarded bucket. A bare closed bucket bypasses
+// the orchestrator's outlier and min-volume filters; the guard serves last-known-good off the pair's
+// trailing baseline. An unvalidated bucket is the guard's fail-open case; an alert has no stale flag to
+// carry that doubt, so it does not fire (sticky).
+func (r priceAlertVWAPReader) adjustServed(b, q canonical.Asset, served timescale.Vwap1mRow, lowConfidence bool) (string, time.Time, bool, error) {
+	if lowConfidence {
+		return "", time.Time{}, false, nil
+	}
 	// The guard's VWAP is the raw quote/base CAGG ratio, as /v1/price reads it before AdjustPrice.
 	// Apply the same correction: the threshold was set from the corrected value, so an uncorrected
 	// comparison is wrong by the pair's decimals skew.
