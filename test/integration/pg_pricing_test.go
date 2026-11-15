@@ -2621,6 +2621,97 @@ func TestOHLCRebuiltVolumeIsTheIntegerSum(t *testing.T) {
 	}
 }
 
+// A folded bar is not served while there are trades in a source bucket the view has not materialised: the fold
+// would publish a closed bar whose close and volume change when the refresh policy catches up. The bound is one for
+// every pair, so a quiet pair's bar is withheld with a busy pair's: the fiat-combined routes merge both, and a bucket
+// built from the quiet one alone would be a wrong bar.
+func TestOHLCFoldWaitsForItsLastSourceBucket(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	dsn := startTimescale(t, ctx)
+	applyMigrations(t, dsn)
+	store, err := timescale.Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("store open: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	usdc, err := canonical.NewClassicAsset("USDC", "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pair, err := canonical.NewPair(canonical.NativeAsset(), usdc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	eurc, err := canonical.NewClassicAsset("EURC", "GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiet, err := canonical.NewPair(canonical.NativeAsset(), eurc)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const fold = 4 * time.Hour
+	t0 := timeBucket(fold, time.Now().UTC().Add(-30*time.Hour))
+	for i, tr := range []canonical.Trade{
+		mkAPITrade(1, t0.Add(10*time.Minute), pair, 3_000_000, 1_000_000),
+		mkAPITrade(2, t0.Add(3*time.Hour+10*time.Minute), pair, 1_000_000, 1_000_000),
+		mkAPITrade(3, t0.Add(20*time.Minute), quiet, 2_000_000, 1_000_000),
+	} {
+		if err := store.InsertTrade(ctx, tr); err != nil {
+			t.Fatalf("InsertTrade %d: %v", i, err)
+		}
+	}
+	readPair := func(p canonical.Pair) []timescale.OHLCBar {
+		t.Helper()
+		bars, err := store.OHLCSeriesReBucketed(ctx, p, timescale.Granularity1h, "4 hours", t0, t0.Add(fold), 10)
+		if err != nil {
+			t.Fatalf("OHLCSeriesReBucketed(%s): %v", p, err)
+		}
+		return bars
+	}
+	read := func() []timescale.OHLCBar { return readPair(pair) }
+
+	// The policy has reached the bucket's first three hours only.
+	if _, err := store.DB().ExecContext(ctx,
+		`CALL refresh_continuous_aggregate('prices_1h', NULL, $1::timestamptz)`, t0.Add(3*time.Hour)); err != nil {
+		t.Fatalf("refresh prices_1h (partial): %v", err)
+	}
+	if bars := read(); len(bars) != 0 {
+		t.Fatalf("fold served %+v with its last hour unmaterialised, want no bar", bars)
+	}
+	if bars := readPair(quiet); len(bars) != 0 {
+		t.Fatalf("fold served the quiet pair's bar %+v while the same bucket is withheld for the other pair", bars)
+	}
+	// A request reads its pairs one after another; a refresh landing in between must not split them.
+	req := timescale.WithFoldBounds(ctx)
+	if bars, err := store.OHLCSeriesReBucketed(req, pair, timescale.Granularity1h, "4 hours", t0, t0.Add(fold), 10); err != nil || len(bars) != 0 {
+		t.Fatalf("first read of the request = %+v (err %v), want no bar", bars, err)
+	}
+
+	if _, err := store.DB().ExecContext(ctx,
+		`CALL refresh_continuous_aggregate('prices_1h', NULL, NULL)`); err != nil {
+		t.Fatalf("refresh prices_1h: %v", err)
+	}
+	bars := read()
+	if len(bars) != 1 {
+		t.Fatalf("fold returned %d bars once materialised, want 1", len(bars))
+	}
+	if bars[0].BaseVolume != "4000000" || bars[0].TradeCount != 2 {
+		t.Fatalf("fold bar = %+v, want both trades (base_volume 4000000, 2 trades)", bars[0])
+	}
+	if bars, err := store.OHLCSeriesReBucketed(req, quiet, timescale.Granularity1h, "4 hours", t0, t0.Add(fold), 10); err != nil || len(bars) != 0 {
+		t.Fatalf("second read of the same request = %+v (err %v) after a refresh, want the first read's bound and no bar", bars, err)
+	}
+	if bars := readPair(quiet); len(bars) != 1 || bars[0].TradeCount != 1 {
+		t.Fatalf("quiet pair's fold = %+v once materialised, want its one trade", bars)
+	}
+}
+
 // An explicit window wider than `limit` intervals must serve the NEWEST `limit` buckets, not the oldest: ORDER BY bucket
 // ASC then LIMIT returned a stale slice starting at `from`, backwards for a chart client sizing `limit` down.
 func TestOHLCSeries_LimitKeepsNewestBucketsInWideWindow(t *testing.T) {
