@@ -192,6 +192,125 @@ func TestApplyF2Fields_SEP41LakeFlowsIncompleteOmitted(t *testing.T) {
 	}
 }
 
+// A contract with no supply event has no measured supply: the detail must not publish "0" (a fully burned
+// token) with a market cap built on it.
+func TestApplyF2Fields_SEP41FlowlessContractIsNotZeroSupply(t *testing.T) {
+	asset, err := canonical.NewSorobanAsset(supplyContractID)
+	if err != nil {
+		t.Fatalf("build soroban asset: %v", err)
+	}
+	flowless := &fakeTokenSupply{supply: clickhouse.TokenSupply{
+		ContractID: supplyContractID,
+		Total:      big.NewInt(0), Mint: big.NewInt(0), Burn: big.NewInt(0), Clawback: big.NewInt(0),
+	}}
+	s := &Server{Options: Options{TokenSupply: flowless}, logger: slog.Default()}
+	detail := &AssetDetail{Decimals: 7}
+	s.applyF2Fields(context.Background(), detail, asset)
+	if detail.TotalSupply != nil || detail.CirculatingSupply != nil || detail.SupplyBasis != nil {
+		t.Errorf("flowless contract: total=%v circulating=%v basis=%v, want all nil",
+			detail.TotalSupply, detail.CirculatingSupply, detail.SupplyBasis)
+	}
+	if detail.MarketCapUSD != nil {
+		t.Errorf("flowless contract: market_cap_usd = %q, want nil", *detail.MarketCapUSD)
+	}
+}
+
+// With no flows the detail reads held balances, as /v1/assets/{id}/supply and the RWA rows do, under that
+// reading's own basis.
+func TestApplyF2Fields_SEP41FlowlessContractReadsStorageBalances(t *testing.T) {
+	asset, err := canonical.NewSorobanAsset(supplyContractID)
+	if err != nil {
+		t.Fatalf("build soroban asset: %v", err)
+	}
+	s := &Server{Options: Options{
+		TokenSupply: &fakeTokenSupply{supply: clickhouse.TokenSupply{
+			ContractID: supplyContractID,
+			Total:      big.NewInt(0), Mint: big.NewInt(0), Burn: big.NewInt(0), Clawback: big.NewInt(0),
+		}},
+		ContractStorageSupply: &fakeStorageSupply{out: clickhouse.ContractStorageSupply{Total: big.NewInt(500), BalanceEntries: 3}},
+	}, logger: slog.Default()}
+	detail := &AssetDetail{Decimals: 7}
+	s.applyF2Fields(context.Background(), detail, asset)
+	if detail.TotalSupply == nil || *detail.TotalSupply != "500" {
+		t.Errorf("total_supply = %v, want \"500\" from held balances", detail.TotalSupply)
+	}
+	if detail.SupplyBasis == nil || *detail.SupplyBasis != "contract_storage_balances" {
+		t.Errorf("supply_basis = %v, want \"contract_storage_balances\"", detail.SupplyBasis)
+	}
+}
+
+// Held balances are a floor: the supply serves under its basis and no market cap is built on it, while a
+// flow-sum supply at the same price still gets one.
+func TestApplyF2Fields_NoMarketCapOnHeldBalances(t *testing.T) {
+	asset, err := canonical.NewSorobanAsset(supplyContractID)
+	if err != nil {
+		t.Fatalf("build soroban asset: %v", err)
+	}
+	price := "2"
+	run := func(flows int64, storage ContractStorageSupplyReader) *AssetDetail {
+		s := &Server{Options: Options{
+			TokenSupply: &fakeTokenSupply{supply: clickhouse.TokenSupply{
+				ContractID: supplyContractID,
+				Total:      big.NewInt(flows), Mint: big.NewInt(flows), Burn: big.NewInt(0), Clawback: big.NewInt(0),
+				FlowCount: uint64(flows),
+			}},
+			ContractStorageSupply: storage,
+		}, logger: slog.Default()}
+		detail := &AssetDetail{Decimals: 7, PriceUSD: &price}
+		s.applyF2Fields(context.Background(), detail, asset)
+		return detail
+	}
+	floor := run(0, &fakeStorageSupply{out: clickhouse.ContractStorageSupply{Total: big.NewInt(50_000_000), BalanceEntries: 3}})
+	if floor.TotalSupply == nil || floor.MarketCapUSD != nil {
+		t.Errorf("held balances: total=%v market_cap=%v, want a supply and no cap", floor.TotalSupply, floor.MarketCapUSD)
+	}
+	measured := run(50_000_000, nil)
+	if measured.MarketCapUSD == nil {
+		t.Errorf("flow sum: market_cap_usd is nil, want a cap (the control)")
+	}
+}
+
+// A flow read that did not answer is a failed read, so the detail is not cached as "no supply".
+func TestApplyF2Fields_UnreadContractSupplyIsAFailedRead(t *testing.T) {
+	asset, err := canonical.NewSorobanAsset(supplyContractID)
+	if err != nil {
+		t.Fatalf("build soroban asset: %v", err)
+	}
+	s := &Server{Options: Options{TokenSupply: &fakeTokenSupply{supplyErr: context.DeadlineExceeded}}, logger: slog.Default()}
+	detail := &AssetDetail{Decimals: 7}
+	s.applyF2Fields(context.Background(), detail, asset)
+	if detail.TotalSupply != nil || !detail.f2ReadFailed {
+		t.Errorf("unread supply: total=%v f2ReadFailed=%v, want nil and true", detail.TotalSupply, detail.f2ReadFailed)
+	}
+	flowless := &Server{Options: Options{TokenSupply: &fakeTokenSupply{supply: clickhouse.TokenSupply{
+		ContractID: supplyContractID, Total: big.NewInt(0), Mint: big.NewInt(0), Burn: big.NewInt(0), Clawback: big.NewInt(0),
+	}}}, logger: slog.Default()}
+	answered := &AssetDetail{Decimals: 7}
+	flowless.applyF2Fields(context.Background(), answered, asset)
+	if answered.f2ReadFailed {
+		t.Errorf("an answered read with no figure is not a failed read")
+	}
+}
+
+// A token whose flows net to zero has a measured supply of zero and is still served.
+func TestApplyF2Fields_SEP41FlowsNettingToZeroAreServed(t *testing.T) {
+	asset, err := canonical.NewSorobanAsset(supplyContractID)
+	if err != nil {
+		t.Fatalf("build soroban asset: %v", err)
+	}
+	burned := &fakeTokenSupply{supply: clickhouse.TokenSupply{
+		ContractID: supplyContractID,
+		Total:      big.NewInt(0), Mint: big.NewInt(100), Burn: big.NewInt(100), Clawback: big.NewInt(0),
+		FlowCount: 2,
+	}}
+	s := &Server{Options: Options{TokenSupply: burned}, logger: slog.Default()}
+	detail := &AssetDetail{Decimals: 7}
+	s.applyF2Fields(context.Background(), detail, asset)
+	if detail.TotalSupply == nil || *detail.TotalSupply != "0" {
+		t.Errorf("total_supply = %v, want \"0\" for flows that net to zero", detail.TotalSupply)
+	}
+}
+
 func mustBigIntInternal(s string) *big.Int {
 	v, ok := new(big.Int).SetString(s, 10)
 	if !ok {
