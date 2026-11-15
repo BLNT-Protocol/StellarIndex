@@ -152,6 +152,9 @@ type AssetDetail struct {
 	// data"; price_usd still serves, only the valuation is guarded.
 	MarketCapLowLiquidity bool `json:"market_cap_low_liquidity,omitempty"`
 
+	// MarketCapLowerBound: on a listing row, market_cap_usd rests on a floor supply, so the cap is a floor too.
+	MarketCapLowerBound bool `json:"market_cap_lower_bound,omitempty"`
+
 	// MarketCapDecimalsMismatch is true when market_cap_usd and fdv_usd were refused because the
 	// lake's on-chain decimals() disagrees with the nonstandard_decimals_assets projection that
 	// price paths normalise through. Price and supply would sit on different scales, so their
@@ -322,6 +325,8 @@ type AssetDetail struct {
 	extensionStale bool
 	// priceUnread: the USD price read failed; a null price_usd is then not "no market".
 	priceUnread bool
+	// priceStale: the price reader served price_usd with its own stale verdict (e.g. a held prior bucket).
+	priceStale bool
 
 	// VolumeCharacter classifies trailing-window volume by account structure: "market" (default),
 	// "operational" (an issuer-side mint/redeem wrap corridor: real, but not market activity) or
@@ -1045,6 +1050,7 @@ func (s *Server) fillRowMarketCap(
 		return
 	}
 	row.MarketCapUSD = &mc
+	row.MarketCapLowerBound = basis.LowerBound()
 	stampCirculatingSupply(row, circ, basis)
 }
 
@@ -1128,18 +1134,6 @@ func settleListingThinRows(rows []AssetDetail) {
 		}
 		obs.PriceServeThinAdmittedTotal.WithLabelValues("listing", string(row.thinFloor)).Inc()
 	}
-}
-
-// listingPriceAllowed is [Server.listingSubstanceVerdict] reduced to yes/no; it fails CLOSED (unmeasured is not allowed).
-func (s *Server) listingPriceAllowed(ctx context.Context, asset canonical.Asset) bool {
-	return s.assetPriceAllowed(ctx, asset, "listing")
-}
-
-// assetPriceAllowed is [Server.listingPriceAllowed] for a caller that is
-// not the listing, counted under its own `surface`.
-func (s *Server) assetPriceAllowed(ctx context.Context, asset canonical.Asset, surface string) bool {
-	allowed, _ := pricingguard.AssetSubstanceVerdict(ctx, s.Substance, asset, s.USDPeggedClassics, surface)
-	return allowed
 }
 
 // listingSubstanceVerdict is the listing's per-row [pricingguard.AssetSubstanceVerdict] over the operator's USD pegs.
@@ -1891,10 +1885,9 @@ func (s *Server) writeCataloguePage(
 	// this writer and neither applies the row filters (stated on all four
 	// parameters in the spec), so no arm has been selected away and the
 	// cross-arm total is the only figure a row here can honestly carry.
-	if s.fillAndRankCatalogueRows(r.Context(), rows, assetListFilters{}) {
-		flags.Stale = true
-		flags.Degraded = true
-	}
+	unmeasured, stale := s.fillAndRankCatalogueRows(r.Context(), rows, assetListFilters{})
+	flags.Stale = flags.Stale || unmeasured || stale
+	flags.Degraded = flags.Degraded || unmeasured
 	end := min(limit, len(rows))
 	page := rows[:end]
 	s.attachSparklinesIfRequested(r, page)
@@ -1954,13 +1947,13 @@ func dropServedCatalogueRows(rows []AssetDetail, served []string) []AssetDetail 
 
 // fillAndRankCatalogueRows fills each row's served money (own price, then the twin merge) and only then ranks by market cap, so
 // order follows published figures; ranking first would rank Stellar-issued rows on nil caps. unmeasured is
-// fillCatalogueStatsForPage's.
-func (s *Server) fillAndRankCatalogueRows(ctx context.Context, rows []AssetDetail, filters assetListFilters) (unmeasured bool) {
+// fillCatalogueStatsForPage's; stale: a row was priced from a read past its freshness ceiling.
+func (s *Server) fillAndRankCatalogueRows(ctx context.Context, rows []AssetDetail, filters assetListFilters) (unmeasured, stale bool) {
 	ctx, rep := withReadReport(ctx)
 	s.fillCataloguePricesForPage(ctx, rows)
 	unmeasured = s.fillCatalogueStatsForPage(ctx, rows, filters)
 	sortAssetDetailsByMarketCapDesc(rows)
-	return unmeasured || rep.unread.Load()
+	return unmeasured || rep.unread.Load(), rep.stale.Load()
 }
 
 // fillCataloguePricesForPage resolves each row's headline USD price through buildGlobalAssetView's fallback chain so listing
@@ -2168,11 +2161,11 @@ func (s *Server) serveCatalogueUnifiedPage(
 	}
 	// Price + twin-stats merge, then the rank, over every catalogue
 	// row BEFORE the slice — writeCataloguePage makes the same call.
-	unmeasured := s.fillAndRankCatalogueRows(r.Context(), rows, filters)
+	unmeasured, stale := s.fillAndRankCatalogueRows(r.Context(), rows, filters)
 	end := min(limit, len(rows))
 	page := rows[:end]
 	s.attachSparklinesIfRequested(r, page)
-	env := Envelope{Data: page, Flags: Flags{Stale: unmeasured, Degraded: unmeasured || anyDirectoryUnchecked(page)}}
+	env := Envelope{Data: page, Flags: Flags{Stale: unmeasured || stale, Degraded: unmeasured || anyDirectoryUnchecked(page)}}
 	if end < len(rows) {
 		for _, row := range page {
 			served = append(served, row.Slug)
@@ -2542,8 +2535,7 @@ func (s *Server) handleAssetGet(w http.ResponseWriter, r *http.Request) {
 	// slow read) yields a numbers-free body with no other signal. Caching it would replay that
 	// degraded snapshot as a fresh 200 for the full TTL, so stamp it stale and skip the cache write.
 	ctxDead := ctx.Err() != nil
-	flags.Stale = flags.Stale || assetDetailStale(&detail, homeDomainDegraded, ctxDead)
-	flags.Degraded = flags.Stale || detail.issuerDirectoryUnchecked
+	flags.Stale, flags.Degraded = detailFreshness(flags.Stale, &detail, homeDomainDegraded, ctxDead)
 
 	// Render once, cache, write; see [assetDetailResponseCache].
 	body, err := renderAssetDetailEnvelope(detail, flags)
@@ -3811,14 +3803,14 @@ func mergeTwinStats(dst *AssetDetail, twin AssetDetail) {
 		dst.Decimals = twin.Decimals
 	}
 	if dst.MarketCapUSD == nil {
-		dst.MarketCapUSD = twin.MarketCapUSD
+		dst.MarketCapUSD, dst.MarketCapLowerBound = twin.MarketCapUSD, twin.MarketCapLowerBound
 	}
 	// The dust-liquidity flag must ride along with the (absent) cap, or the catalogue row would
 	// show nothing where the twin shows market_cap_low_liquidity. When suppressed, null cap and
 	// FDV too so a stale value never coexists with the flag, as in populateMarketCap.
 	if twin.MarketCapLowLiquidity {
 		dst.MarketCapLowLiquidity = true
-		dst.MarketCapUSD = nil
+		dst.MarketCapUSD, dst.MarketCapLowerBound = nil, false
 		dst.FDVUSD = nil
 	}
 	// The listing valuation ran on the twin, which carries the asset_id, price and gate outcome it

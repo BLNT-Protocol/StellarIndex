@@ -221,8 +221,8 @@ func suppressScamIssuerPricing(d *AssetDetail) {
 	case d.PriceUSD != nil:
 		d.PriceWithheldReason = PriceWithheldUnattributed
 	}
-	d.PriceUSD = nil
-	d.MarketCapUSD = nil
+	d.PriceUSD, d.priceStale = nil, false
+	d.MarketCapUSD, d.MarketCapLowerBound = nil, false
 	d.FDVUSD = nil
 	d.Change1hPct = nil
 	d.Change24hPct = nil
