@@ -189,79 +189,122 @@ func decodePoolGulpEmissions(ev *events.Event, out *Event) error {
 	return err
 }
 
-func decodePoolAdmin(ev *events.Event, out *Event) error { //nolint:gocyclo,cyclop // six fixed ABI variants.
-	var err error
+func decodePoolAdmin(ev *events.Event, out *Event) error {
 	switch out.EventType {
 	case "set_admin":
-		if err = requireTopics(ev, 2); err == nil {
-			out.Admin, err = topicAddress(ev, 1)
-		}
-		if err == nil {
-			out.Target, err = bodyAddress(ev)
-		}
+		return decodePoolSetAdmin(ev, out)
 	case "update_pool":
-		if err = requireTopics(ev, 2); err == nil {
-			out.Admin, err = topicAddress(ev, 1)
-		}
-		var values []scval.ScVal
-		if err == nil {
-			values, err = bodyTuple(ev, 3)
-		}
-		if err == nil {
-			var rate, positions uint32
-			rate, err = scval.AsU32(values[0])
-			if err == nil {
-				positions, err = scval.AsU32(values[1])
-			}
-			if err == nil {
-				out.Amount, err = amount(values[2])
-			}
-			out.Attributes["backstop_take_rate"] = rate
-			out.Attributes["max_positions"] = positions
-		}
+		return decodePoolUpdate(ev, out)
 	case "queue_set_reserve":
-		if err = requireTopics(ev, 2); err == nil {
-			out.Admin, err = topicAddress(ev, 1)
-		}
-		var values []scval.ScVal
-		if err == nil {
-			values, err = bodyTuple(ev, 2)
-		}
-		if err == nil {
-			out.Asset, err = scval.AsAddressStrkey(values[0])
-		}
-		if err == nil {
-			out.Attributes["reserve_config"], err = decodeReserveConfig(values[1])
-		}
+		return decodePoolQueueReserve(ev, out)
 	case "cancel_set_reserve":
-		if err = requireTopics(ev, 2); err == nil {
-			out.Admin, err = topicAddress(ev, 1)
-		}
-		if err == nil {
-			out.Asset, err = bodyAddress(ev)
-		}
+		return decodePoolCancelReserve(ev, out)
 	case "set_reserve":
-		if err = requireTopics(ev, 1); err == nil {
-			var values []scval.ScVal
-			values, err = bodyTuple(ev, 2)
-			if err == nil {
-				out.Asset, err = scval.AsAddressStrkey(values[0])
-			}
-			if err == nil {
-				out.Attributes["reserve_index"], err = scval.AsU32(values[1])
-			}
-		}
+		return decodePoolSetReserve(ev, out)
 	case "set_status":
-		if len(ev.Topic) != 1 && len(ev.Topic) != 2 {
-			return fmt.Errorf("expected 1 or 2 topics, got %d", len(ev.Topic))
-		}
-		if len(ev.Topic) == 2 {
-			out.Admin, err = topicAddress(ev, 1)
-		}
-		if err == nil {
-			out.Attributes["status"], err = bodyU32(ev)
+		return decodePoolSetStatus(ev, out)
+	default:
+		return ErrNotBLNTEvent
+	}
+}
+
+func decodePoolSetAdmin(ev *events.Event, out *Event) error {
+	if err := requireTopics(ev, 2); err != nil {
+		return err
+	}
+	var err error
+	if out.Admin, err = topicAddress(ev, 1); err != nil {
+		return err
+	}
+	out.Target, err = bodyAddress(ev)
+	return err
+}
+
+func decodePoolUpdate(ev *events.Event, out *Event) error {
+	if err := requireTopics(ev, 2); err != nil {
+		return err
+	}
+	var err error
+	if out.Admin, err = topicAddress(ev, 1); err != nil {
+		return err
+	}
+	values, err := bodyTuple(ev, 3)
+	if err != nil {
+		return err
+	}
+	rate, err := scval.AsU32(values[0])
+	if err != nil {
+		return fmt.Errorf("backstop_take_rate: %w", err)
+	}
+	positions, err := scval.AsU32(values[1])
+	if err != nil {
+		return fmt.Errorf("max_positions: %w", err)
+	}
+	if out.Amount, err = amount(values[2]); err != nil {
+		return fmt.Errorf("min_collateral: %w", err)
+	}
+	out.Attributes["backstop_take_rate"] = rate
+	out.Attributes["max_positions"] = positions
+	return nil
+}
+
+func decodePoolQueueReserve(ev *events.Event, out *Event) error {
+	if err := requireTopics(ev, 2); err != nil {
+		return err
+	}
+	var err error
+	if out.Admin, err = topicAddress(ev, 1); err != nil {
+		return err
+	}
+	values, err := bodyTuple(ev, 2)
+	if err != nil {
+		return err
+	}
+	if out.Asset, err = scval.AsAddressStrkey(values[0]); err != nil {
+		return fmt.Errorf("asset: %w", err)
+	}
+	out.Attributes["reserve_config"], err = decodeReserveConfig(values[1])
+	return err
+}
+
+func decodePoolCancelReserve(ev *events.Event, out *Event) error {
+	if err := requireTopics(ev, 2); err != nil {
+		return err
+	}
+	var err error
+	if out.Admin, err = topicAddress(ev, 1); err != nil {
+		return err
+	}
+	out.Asset, err = bodyAddress(ev)
+	return err
+}
+
+func decodePoolSetReserve(ev *events.Event, out *Event) error {
+	if err := requireTopics(ev, 1); err != nil {
+		return err
+	}
+	values, err := bodyTuple(ev, 2)
+	if err != nil {
+		return err
+	}
+	if out.Asset, err = scval.AsAddressStrkey(values[0]); err != nil {
+		return fmt.Errorf("asset: %w", err)
+	}
+	out.Attributes["reserve_index"], err = scval.AsU32(values[1])
+	return err
+}
+
+func decodePoolSetStatus(ev *events.Event, out *Event) error {
+	if len(ev.Topic) != 1 && len(ev.Topic) != 2 {
+		return fmt.Errorf("expected 1 or 2 topics, got %d", len(ev.Topic))
+	}
+	var err error
+	if len(ev.Topic) == 2 {
+		if out.Admin, err = topicAddress(ev, 1); err != nil {
+			return err
 		}
 	}
+	out.Attributes["status"], err = bodyU32(ev)
 	return err
 }
 
@@ -269,11 +312,19 @@ var reserveConfigFields = []struct {
 	name     string
 	typeName string
 }{
-	{"index", "u32"}, {"decimals", "u32"}, {"c_factor", "u32"},
-	{"l_factor", "u32"}, {"util", "u32"}, {"max_util", "u32"},
-	{"r_base", "u32"}, {"r_one", "u32"}, {"r_two", "u32"},
-	{"r_three", "u32"}, {"reactivity", "u32"},
-	{"supply_cap", "i128"}, {"enabled", "bool"},
+	{"index", "u32"},
+	{"decimals", "u32"},
+	{"c_factor", "u32"},
+	{"l_factor", "u32"},
+	{"util", "u32"},
+	{"max_util", "u32"},
+	{"r_base", "u32"},
+	{"r_one", "u32"},
+	{"r_two", "u32"},
+	{"r_three", "u32"},
+	{"reactivity", "u32"},
+	{"supply_cap", "i128"},
+	{"enabled", "bool"},
 }
 
 func decodeReserveConfig(sv scval.ScVal) (map[string]any, error) {
