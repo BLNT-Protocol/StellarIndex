@@ -65,11 +65,14 @@ func TestRoleEventCatalogueClassifiesEveryDeclaredKind(t *testing.T) {
 	}
 }
 
-func TestDecoderDecodePreservesWireAndRole(t *testing.T) {
+func TestDecoderDecodeProjectsTypedFields(t *testing.T) {
 	t.Parallel()
 	d := NewDecoder()
-	ev := testEvent(MainnetBackstop, "claim")
-	ev.Topic = append(ev.Topic, scval.MustEncodeSymbol("FirstLoss"))
+	ev := testEvent(MainnetBackstop, "backfill_funded")
+	ev.Value = encodeTestScVal(t, sdkxdr.ScVal{
+		Type: sdkxdr.ScValTypeScvI128,
+		I128: &sdkxdr.Int128Parts{Lo: 42},
+	})
 	out, err := d.Decode(ev)
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
@@ -78,18 +81,21 @@ func TestDecoderDecodePreservesWireAndRole(t *testing.T) {
 		t.Fatalf("Decode outputs = %d, want 1", len(out))
 	}
 	got := out[0].(Event)
-	if got.Role != RoleBackstop || got.EventType != "claim" || got.EventKind() != BackstopEventKind {
+	if got.Role != RoleBackstop || got.EventType != "backfill_funded" || got.EventKind() != BackstopEventKind {
 		t.Fatalf("decoded identity = role %q type %q kind %q", got.Role, got.EventType, got.EventKind())
 	}
-	if len(got.TopicsXDR) != len(ev.Topic) || got.TopicsXDR[1] != ev.Topic[1] || got.ValueXDR != ev.Value {
-		t.Fatal("Decode did not preserve the complete event wire")
+	if got.Amount == nil || got.Amount.String() != "42" {
+		t.Fatalf("decoded amount = %v, want 42", got.Amount)
+	}
+	if got.Attributes == nil {
+		t.Fatal("decoded attributes map is nil")
 	}
 }
 
 func TestDecoderRejectsMalformedXDR(t *testing.T) {
 	t.Parallel()
 	d := NewDecoder()
-	ev := testEvent(MainnetFixedPool, "supply")
+	ev := testEvent(MainnetBackstop, "backfill_funded")
 	ev.Value = "not-base64"
 	_, err := d.Decode(ev)
 	if !errors.Is(err, ErrMalformedEvent) {
@@ -119,11 +125,7 @@ func encodedContractAddress(t *testing.T, fill byte) (string, string) {
 	}
 	addr := sdkxdr.ScAddress{Type: sdkxdr.ScAddressTypeScAddressTypeContract, ContractId: &cid}
 	sv := sdkxdr.ScVal{Type: sdkxdr.ScValTypeScvAddress, Address: &addr}
-	raw, err := sv.MarshalBinary()
-	if err != nil {
-		t.Fatalf("marshal contract address: %v", err)
-	}
-	b64 := base64.StdEncoding.EncodeToString(raw)
+	b64 := encodeTestScVal(t, sv)
 	parsed, err := scval.Parse(b64)
 	if err != nil {
 		t.Fatalf("parse encoded address: %v", err)
@@ -133,4 +135,13 @@ func encodedContractAddress(t *testing.T, fill byte) (string, string) {
 		t.Fatalf("strkey encoded address: %v", err)
 	}
 	return b64, strkey
+}
+
+func encodeTestScVal(t *testing.T, sv sdkxdr.ScVal) string {
+	t.Helper()
+	raw, err := sv.MarshalBinary()
+	if err != nil {
+		t.Fatalf("marshal SCVal: %v", err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
 }

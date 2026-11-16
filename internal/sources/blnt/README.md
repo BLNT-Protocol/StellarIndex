@@ -13,13 +13,14 @@ contracts. Every accepted event becomes one `blnt_events` row carrying:
 
 - canonical ledger, transaction, operation and event identity;
 - the emitting contract's verified role;
-- decoded topic-zero event type; and
-- the complete topic and value SCVal XDR, losslessly preserved as base64.
+- decoded topic-zero event type;
+- typed common fields such as pool, user, asset, tier and raw i128 amounts; and
+- decoded event-specific structures in JSON attributes.
 
 The projection is an event catalogue, not a spot-price source and not yet a
 derived lending-position index. It never emits `canonical.Trade` and never
-enters VWAP. Keeping the complete XDR makes future typed position, tier and
-auction projections reproducible without incorrectly reusing Blend V2 schemas.
+enters VWAP. Raw XDR is not duplicated: the lake and shared `soroban_events`
+landing zone retain it for replay into this typed projection.
 
 ## Identity gate
 

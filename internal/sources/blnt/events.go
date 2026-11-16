@@ -4,9 +4,8 @@
 // event surface is not wire-compatible with every Blend V1/V2 table. In
 // particular, V3 adds tiered backstops, a fourth auction type, clawback and
 // reserve-loss events, and two distinct backfill contracts. This package keeps
-// BLNT V3 under its own source identity and persists the complete event XDR so
-// later, narrower state projections can be reproduced without borrowing V2
-// semantics.
+// BLNT V3 under its own source identity and projects typed event fields; raw XDR
+// remains in the lake and the shared soroban_events landing zone.
 package blnt
 
 import (
@@ -14,6 +13,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Stellar-Index/StellarIndex/internal/canonical"
 	"github.com/Stellar-Index/StellarIndex/internal/consumer"
 	"github.com/Stellar-Index/StellarIndex/internal/scval"
 )
@@ -51,6 +51,15 @@ const (
 	RoleEmitter        Role = "emitter"
 	RoleBackfill       Role = "backfill"
 	RoleLockupBackfill Role = "lockup_backfill"
+)
+
+// Tier is the decoded BackstopTier contract enum.
+type Tier string
+
+const (
+	TierFirstLoss  Tier = "first_loss"
+	TierSecondLoss Tier = "second_loss"
+	TierThirdLoss  Tier = "third_loss"
 )
 
 // Consumer event kinds. Each role gets a distinct kind so the API and
@@ -109,9 +118,11 @@ var encodedRoleEvents = func() map[Role]map[string]string {
 	return out
 }()
 
-// Event is one lossless BLNT V3 contract event. EventType is the decoded
-// topic[0] symbol; TopicsXDR and ValueXDR retain the complete base64 SCVal wire
-// values. This is deliberately not a canonical.Trade and never enters VWAP.
+// Event is one typed BLNT V3 contract event. EventType is the decoded topic[0]
+// symbol. Common query fields are promoted; Attributes carries only decoded,
+// event-specific fields such as reserve configuration and auction legs. Raw XDR
+// is deliberately not duplicated from the lake. This is never a canonical.Trade
+// and never enters VWAP.
 type Event struct {
 	ContractID string
 	Ledger     uint32
@@ -121,8 +132,22 @@ type Event struct {
 	ObservedAt time.Time
 	Role       Role
 	EventType  string
-	TopicsXDR  []string
-	ValueXDR   string
+
+	Pool         string
+	UserAddress  string
+	Asset        string
+	Counterparty string
+	Target       string
+	Admin        string
+	Tier         Tier
+	AuctionType  *uint32
+
+	Amount  *canonical.Amount
+	Amount2 *canonical.Amount
+	Amount3 *canonical.Amount
+	Amount4 *canonical.Amount
+
+	Attributes map[string]any
 }
 
 // EventKind implements consumer.Event with a distinct kind per contract ABI.

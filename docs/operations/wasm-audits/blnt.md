@@ -47,12 +47,11 @@ The machine-readable roster is
 
 ## Decoder review
 
-The decoder stores a lossless envelope: exact topic and value XDR plus contract,
-ledger, transaction, operation, event index, close time, role and topic-0 event
-name. It does not interpret amounts or project these events into Blend V2
-tables. Consequently, the per-hash review is limited to identity gating and
-the event-name catalogue; body-shape changes remain preserved rather than
-silently reinterpreted.
+The decoder stores a typed event projection: contract and ledger identity,
+role, topic-0 event name, common addresses, tier and raw i128 amounts, plus
+decoded event-specific structures in JSON attributes. It does not project
+these events into Blend V2 tables. Raw topic and value XDR remain in the lake
+and shared `soroban_events`, so this table does not duplicate it.
 
 The source at each deployed commit was checked against `roleEvents`:
 
@@ -66,8 +65,8 @@ The source at each deployed commit was checked against `roleEvents`:
 | lockup backfill | `fund`, `claim`, `claim_fund`, `expire` |
 
 Factory `deploy` is additionally shape-checked as a single address body before
-the announced child is admitted. All other accepted events parse every topic
-and body SCVal, then preserve the original bytes.
+the announced child is admitted. Every accepted event parses its complete
+role-specific topic and body shape before typed fields are emitted.
 
 ## Galexie replay fixtures
 
@@ -77,7 +76,8 @@ including a factory deployment, tiered backstop deposit, emitter distribution,
 primary-backfill claim and swap, lockup funding and claim-funding, and pool
 supply/flash-loan/repay events. `TestRealFixturesDecodeEveryAuditedRole`
 requires every fixture directory to be audited for `blnt`, verifies topic-0
-bytes and lossless identity, and fails if any role loses real-lake coverage.
+bytes, ledger identity and role-specific typed fields, and fails if any role
+loses real-lake coverage.
 
 Observed fixture range: ledgers 65,134,362 through 65,387,356. Fixtures are
 regression evidence, not the lineage authority; the production replay gate

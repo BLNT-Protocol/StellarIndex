@@ -103,18 +103,65 @@ func TestRealFixturesDecodeEveryAuditedRole(t *testing.T) {
 			got := out[0].(Event)
 			if got.Role != f.Role || got.EventType != f.EventName || got.ContractID != f.ContractID ||
 				got.Ledger != f.Ledger || got.TxHash != f.TxHash || int(got.OpIndex) != f.OpIndex ||
-				int(got.EventIndex) != f.EventIndex || got.ValueXDR != f.Value ||
-				strings.Join(got.TopicsXDR, ",") != strings.Join(f.Topics, ",") {
-				t.Fatalf("decoded envelope differs from Galexie fixture: %+v", got)
+				int(got.EventIndex) != f.EventIndex {
+				t.Fatalf("decoded identity differs from Galexie fixture: %+v", got)
 			}
 			if got.ObservedAt.UTC().Format("2006-01-02T15:04:05Z") != f.LedgerClosedAt {
 				t.Fatalf("close time = %s, want %s", got.ObservedAt, f.LedgerClosedAt)
 			}
+			assertFixtureTypedProjection(t, got)
 		})
 	}
 	for hash, role := range wantHashes {
 		if !seen[hash] {
 			t.Errorf("no real fixture for %s WASM %s", role, hash)
 		}
+	}
+}
+
+func assertFixtureTypedProjection(t *testing.T, got Event) {
+	t.Helper()
+	if got.Attributes == nil {
+		t.Fatal("attributes map is nil")
+	}
+	switch got.Role + "/" + Role(got.EventType) {
+	case RoleBackstop + "/deposit":
+		if got.Pool == "" || got.UserAddress == "" || got.Tier == "" || got.Amount == nil || got.Amount2 == nil {
+			t.Fatalf("deposit typed projection is incomplete: %+v", got)
+		}
+	case RolePool + "/flash_loan":
+		if got.Asset == "" || got.UserAddress == "" || got.Counterparty == "" || got.Amount == nil || got.Amount2 == nil {
+			t.Fatalf("flash-loan typed projection is incomplete: %+v", got)
+		}
+	case RolePool + "/repay", RolePool + "/supply_collateral":
+		if got.Asset == "" || got.UserAddress == "" || got.Amount == nil || got.Amount2 == nil {
+			t.Fatalf("pool-position typed projection is incomplete: %+v", got)
+		}
+	case RoleEmitter + "/distribute":
+		if got.Target == "" || got.Amount == nil {
+			t.Fatalf("emitter distribution typed projection is incomplete: %+v", got)
+		}
+	case RoleLockupBackfill + "/claim_fund":
+		if got.Amount == nil || got.Amount2 == nil || got.Amount3 == nil || got.Amount4 == nil {
+			t.Fatalf("claim_fund typed projection is incomplete: %+v", got)
+		}
+	case RoleLockupBackfill + "/fund":
+		if got.UserAddress == "" || got.Amount == nil || got.Amount2 == nil {
+			t.Fatalf("lockup fund typed projection is incomplete: %+v", got)
+		}
+	case RoleFactory + "/deploy":
+		if got.Target == "" {
+			t.Fatalf("factory deploy typed projection is incomplete: %+v", got)
+		}
+	case RoleBackfill + "/claim":
+		if got.UserAddress == "" || got.Amount == nil {
+			t.Fatalf("backfill claim typed projection is incomplete: %+v", got)
+		}
+	case RoleBackfill + "/swap_blnd":
+		if got.UserAddress == "" || got.Amount == nil || got.Amount2 == nil || got.Amount3 == nil {
+			t.Fatalf("backfill swap typed projection is incomplete: %+v", got)
+		}
+	default:
+		t.Fatalf("fixture lacks typed-projection assertion for %s/%s", got.Role, got.EventType)
 	}
 }

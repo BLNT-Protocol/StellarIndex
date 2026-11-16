@@ -58,8 +58,8 @@ func (d *Decoder) Matches(ev events.Event) bool {
 	return role != "" && classify(role, &ev) != ""
 }
 
-// Decode produces exactly one lossless semantic-envelope event. A canonical
-// factory deploy also admits the announced child pool for later events.
+// Decode produces exactly one typed protocol event. A canonical factory deploy
+// also admits the announced child pool for later events.
 func (d *Decoder) Decode(ev events.Event) ([]consumer.Event, error) {
 	role := d.roleOf(ev.ContractID)
 	kind := classify(role, &ev)
