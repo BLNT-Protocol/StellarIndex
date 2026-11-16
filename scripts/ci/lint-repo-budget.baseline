@@ -12,5 +12,4 @@ go-lines internal/api/v1/assets.go 3951
 go-lines internal/api/v1/price.go 2627
 go-lines internal/api/v1/server.go 2365
 go-lines internal/obs/metrics.go 3700
-go-lines internal/pipeline/sink.go 2074
 go-lines internal/storage/clickhouse/explorer_reader.go 2266
