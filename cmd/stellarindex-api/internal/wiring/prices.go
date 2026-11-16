@@ -174,6 +174,9 @@ func PriceWithheld(
 		opt(&q)
 	}
 	adm := v1.ThinAdmissionFrom(ctx)
+	if q.shared {
+		adm = nil
+	}
 	gate := pricingguard.Gate{Substance: substance, Scam: scam}
 	v := gate.Judge(ctx, base, quote, surface, pricingguard.Query{
 		PointInTime: q.pointInTime,
@@ -181,6 +184,10 @@ func PriceWithheld(
 		AdmitThin:   adm.Requested() && adm.Covers(base, quote),
 	})
 	adm.Record(base, quote, v)
+	if q.shared && v.Unmeasured && v.Withholding == pricingguard.NotWithheld {
+		// One caller's read may fail open; an answer kept for every caller may not.
+		return pricingguard.WithheldThinMarket
+	}
 	return v.Withholding
 }
 
@@ -190,6 +197,7 @@ func PriceWithheld(
 type withholdingQuery struct {
 	pointInTime bool
 	at          time.Time
+	shared      bool
 }
 
 type WithholdingOption func(*withholdingQuery)
@@ -200,6 +208,13 @@ func AsOfInstant(ts time.Time) WithholdingOption {
 		q.pointInTime = true
 		q.at = ts
 	}
+}
+
+// ForSharedRead marks a read whose answer is kept for every caller: the calling request's `include_thin` opt-in
+// does not admit it, its verdict is not recorded as that request's evidence, and a market the gate could not
+// measure is withheld.
+func ForSharedRead() WithholdingOption {
+	return func(q *withholdingQuery) { q.shared = true }
 }
 
 type StorePriceReader struct {

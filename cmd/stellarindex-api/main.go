@@ -935,7 +935,7 @@ func run(cfgPath string, dryRun bool) error { //nolint:gocognit,funlen,gocyclo /
 		IssuerAuthFlags:    issuerAuthFlagsReader,
 		StaticHomeDomain:   homeDomainLookup.static,
 		Volume:             wiring.StoreVolumeReader{S: store},
-		Change24h:          newMinuteChange24hReader(storeChange24hReader{s: store, pegs: usdPegs, decimals: nonstandardDecimalsCache, logger: logger}),
+		Change24h:          newMinuteChange24hReader(storeChange24hReader{s: store, pegs: usdPegs, decimals: nonstandardDecimalsCache, substance: substanceGate, scam: scamGate, logger: logger}),
 		PriceAt:            storePriceAtReader{s: store, substance: substanceGate, scam: scamGate, logger: logger.With("component", "price-at-guard")},
 		ChangeSummary:      store,
 		AssetsReader:       cachedAssetsReader,
@@ -2073,11 +2073,19 @@ var usdQuoteAsset = func() canonical.Asset {
 // storeChange24hReader serves the latest closed prices_1m bucket at or before now-24h; sql.ErrNoRows becomes v1.ErrChange24hUnavailable.
 // On a literal miss it tries asset/<peg> from the operator-declared USD-pegged set (nothing on-chain quotes fiat:USD); decimals
 // normalises the anchor (see normalizeChange24hAnchor).
+// change24hStore is the part of *timescale.Store the anchor reads.
+type change24hStore interface {
+	ClosedVWAP1mAtOrBefore(ctx context.Context, p canonical.Pair, at time.Time) (timescale.Vwap1mRow, error)
+	pricingguard.TrailingAtReader
+}
+
 type storeChange24hReader struct {
-	s        *timescale.Store
-	pegs     []canonical.Asset
-	decimals aggregate.DecimalsLookup
-	logger   *slog.Logger // nil → guard logging disabled
+	s         change24hStore
+	pegs      []canonical.Asset
+	decimals  aggregate.DecimalsLookup
+	substance *pricingguard.SubstanceGate // nil → no thin-market gate
+	scam      *pricingguard.ScamGate      // nil → no scam-issuer gate
+	logger    *slog.Logger                // nil → guard logging disabled
 }
 
 // change24hAnchorMaxStaleness is unbounded because ClosedVWAP1mAtOrBefore bounds nothing either.
@@ -2088,12 +2096,19 @@ var errChange24hAnchorGuarded = errors.New("change_24h anchor refused by the ser
 
 func (r storeChange24hReader) USDPrice24hAgo(ctx context.Context, asset canonical.Asset) (string, error) {
 	at := time.Now().Add(-24 * time.Hour)
-	// Each anchor passes the serving-sanity guard; a refused bucket moves on to the next market,
-	// so a manipulated minute is never the divisor of a percentage.
+	// Each anchor found passes the withholding gates as of its instant and then the serving-sanity guard; a
+	// refused market moves on to the next, so neither a withheld market nor a manipulated minute is the divisor
+	// of a percentage. The gates are asked only about a market that has a bucket, as LatestPrice does: most
+	// assets have none in their literal USD pair. The anchor is kept for every caller (minuteChange24hReader),
+	// hence the shared read.
 	guardedAnchor24h := func(ctx context.Context, pair canonical.Pair, at time.Time) (timescale.Vwap1mRow, error) {
 		row, err := r.s.ClosedVWAP1mAtOrBefore(ctx, pair, at)
 		if err != nil {
 			return timescale.Vwap1mRow{}, err
+		}
+		if wiring.PriceWithheld(ctx, r.substance, r.scam, pair.Base, pair.Quote, "change_anchor",
+			wiring.AsOfInstant(at), wiring.ForSharedRead()) != pricingguard.NotWithheld {
+			return timescale.Vwap1mRow{}, errChange24hAnchorGuarded
 		}
 		served, ok := pricingguard.GuardServedVWAP1mAt(ctx, r.s, r.logger, pair, row, at, change24hAnchorMaxStaleness)
 		if !ok {
