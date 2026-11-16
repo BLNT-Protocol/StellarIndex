@@ -780,6 +780,27 @@ func TestAccountErasureTrigger(t *testing.T) {
 	if staffMeta != `{"actor_key_id": "kid"}203.0.113.1` {
 		t.Errorf("staff row after scrub = %s, want slug removed and address kept", staffMeta)
 	}
+
+	// A webhook row names the customer's receiver host at the top level and, on an update, the one it moved from.
+	var hookRow uuid.UUID
+	mustScan(t, ctx, db, &hookRow, `INSERT INTO audit_log (account_id, actor_kind, action, metadata)
+		VALUES ($1, 'user', 'webhook.update', '{"url_host":"hooks.customer.example","previous_url_host":"old.customer.example","url_changed":true,"events":["price.alert"],"enabled":true}') RETURNING id`, acct)
+	if err := inTx(acct.String(), `UPDATE audit_log SET metadata = audit_log_erase_metadata(metadata) WHERE id = $1`, hookRow); err != nil {
+		t.Fatalf("permitted webhook scrub refused: %v", err)
+	}
+	var hookMeta string
+	mustScan(t, ctx, db, &hookMeta, `SELECT metadata::text FROM audit_log WHERE id = $1`, hookRow)
+	if hookMeta != `{"events": ["price.alert"], "enabled": true, "url_changed": true}` {
+		t.Errorf("webhook row after scrub = %s, want both receiver hosts removed", hookMeta)
+	}
+
+	// A staff key mint carries the bare slug; a refused passkey sign-in carries the passkey's name.
+	var others string
+	mustScan(t, ctx, db, &others, `SELECT audit_log_erase_metadata(
+		'{"target_account":"trig","tier":"pro","credential_name":"Jo''s phone","stored_sign_count":3}')::text`)
+	if others != `{"tier": "pro", "stored_sign_count": 3}` {
+		t.Errorf("erase function left %s, want the slug and the passkey name removed", others)
+	}
 }
 
 func mustExec(t *testing.T, ctx context.Context, db *sql.DB, q string, args ...any) {
