@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,6 +229,15 @@ func (s *Server) revokeOwnedPlatformKey(ctx context.Context, identifier, keyID, 
 	}
 	if auth.AccountIdentifier(owner.Slug) != identifier {
 		return platform.ErrNotFound
+	}
+	// The postgres validator serves a derived `apikey-cache:` row for up to its TTL; a revoke that
+	// leaves it is not a revoke. Evicted BEFORE the row is revoked, so a failed eviction fails the
+	// whole call with the row still live and a retry does both; the eviction's tombstone stops a
+	// lookup re-caching the row in between.
+	if inv := s.APIKeyBudgets.CacheInvalidator; inv != nil {
+		if err := inv.InvalidateCachedKey(ctx, hex.EncodeToString(k.KeyHash)); err != nil {
+			return fmt.Errorf("revoke: evict auth cache for key %s: %w", keyID, err)
+		}
 	}
 	return keys.Revoke(ctx, k.AccountID, keyID, uuid.Nil, reason)
 }
